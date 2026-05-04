@@ -1,0 +1,172 @@
+version: 1
+root: .
+name: statika
+
+default_profile: default
+
+output:
+  dir: /home/darius/tmp/
+  pattern: statika_{profile}_{ts}_{gitsha}.md
+  latest: ""
+  stdout_default: false
+
+render:
+  format: md
+  newline: |4+
+  code_fences: true
+  include_tree: true
+  tree_depth: 4
+  include_manifest: true
+  manifest:
+    group_by_slice: true
+    include_line_counts: true
+    include_byte_counts: true
+    include_truncation_notes: true
+    include_unreadable_notes: true
+  file_block:
+    header: <<<FILE:{path}>>>
+    footer: ""
+
+budgets:
+  max_chars: 120000
+  per_file_max_lines: 800
+  per_file_max_bytes: 262144
+  drop_policy: drop_low_priority
+
+ignore:
+  use_gitignore: true
+  always:
+    - .git/**
+    - target/**
+    - .snip/**
+    - node_modules/**
+    - dist/**
+    - build/**
+    - coverage/**
+  binary_extensions:
+    - .png
+    - .jpg
+    - .jpeg
+    - .gif
+    - .pdf
+    - .zip
+    - .tar
+    - .gz
+    - .7z
+    - .exe
+    - .dll
+    - .so
+    - .dylib
+
+sensitive:
+  exclude_globs:
+    - .env*
+    - '**/*secret*'
+    - '**/*secrets*'
+    - '**/*.pem'
+    - '**/*.key'
+    - '**/id_rsa*'
+
+slices:
+
+  rust_core:
+    include:
+      - src/**/*.rs
+      - src/*.rs
+    exclude: []
+    priority: 100
+
+  rust_tests:
+    include:
+      - tests/**
+      - '**/*_test.rs'
+      - '**/*_tests.rs'
+    exclude: []
+    priority: 40
+
+  cargo:
+    include:
+      - Cargo.toml
+      - Cargo.lock
+    exclude: []
+    priority: 90
+
+  configs:
+    include:
+      - '**/*.yaml'
+      - '**/*.yml'
+      - '**/*.json'
+      - '**/*.toml'
+      - '**/*.ini'
+      - .env.example
+    exclude: []
+    priority: 20
+
+  docs:
+    include:
+      - README*
+      - docs/**
+      - '*.md'
+      - LICENSE
+    exclude: []
+    priority: 15
+
+  infra:
+    include:
+      - Dockerfile*
+      - docker-compose*.yml
+      - Makefile
+      - justfile
+      - .github/**
+      - .gitlab/**
+    exclude: []
+    priority: 10
+
+
+profiles:
+
+  minimal:
+    enable:
+      - cargo
+      - rust_core
+    budgets:
+      max_chars: 0
+    render:
+      tree_depth: 0
+
+  default:
+    enable:
+      - cargo
+      - rust_core
+      - docs
+      - configs
+    budgets:
+      max_chars: 0
+    render:
+      tree_depth: 0
+
+  debug:
+    enable:
+      - cargo
+      - rust_core
+      - rust_tests
+      - docs
+      - configs
+    budgets:
+      max_chars: 0
+    render:
+      tree_depth: 0
+
+  full:
+    enable:
+      - cargo
+      - rust_core
+      - rust_tests
+      - configs
+      - docs
+      - infra
+    budgets:
+      max_chars: 0
+    render:
+      tree_depth: 0
+
