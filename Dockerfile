@@ -1,9 +1,11 @@
 FROM rust:stable-alpine AS builder
 RUN apk add --no-cache musl-dev
 WORKDIR /src
-COPY Cargo.toml ./
+
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tests ./tests
+
 RUN rustup target add x86_64-unknown-linux-musl
 RUN cargo build --release --target x86_64-unknown-linux-musl
 
