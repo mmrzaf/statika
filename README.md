@@ -110,32 +110,3 @@ COPY --from=frontend-builder /app/dist/ /srv/www/
 
 EXPOSE 8080
 ```
-
----
-
-## GitHub Actions (CI/CD to GHCR)
-
-Statika images can be automatically built and published:
-
-* Builds on push to `main`
-* Tags on version releases (`v*`)
-* Publishes to GHCR (`ghcr.io/<owner>/statika`)
-
-(See `.github/workflows/docker.yml`)
-
----
-
-## Design Notes
-
-* Minimal runtime footprint (`scratch`-based image)
-* Zero Node.js in production images
-* Optimized for immutable deployments
-* Works well in Kubernetes, Docker Swarm, or bare containers
-
-```
-
----
-
-If you want, next step is tightening the GHCR strategy further (digest pinning + multi-arch builds + SBOM signing), which is where this becomes enterprise-grade instead of “just working.”
-```
-
