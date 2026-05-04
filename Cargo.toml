@@ -1,0 +1,15 @@
+[package]
+name = "statika"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "statika"
+path = "src/main.rs"
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true
