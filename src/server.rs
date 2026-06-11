@@ -748,7 +748,7 @@ unsafe extern "C" fn shutdown_signal(_signal: libc::c_int) {
 
 fn install_signal_handlers() -> io::Result<()> {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-    action.sa_sigaction = shutdown_signal as usize;
+    action.sa_sigaction = shutdown_signal as *const () as usize;
     action.sa_flags = 0;
     unsafe {
         libc::sigemptyset(&mut action.sa_mask);
