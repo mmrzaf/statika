@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      - name: Build container
+        run: docker build -t statika:test .
+      - name: Smoke test container
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/www/assets"
+          printf 'ok' > "$RUNNER_TEMP/www/index.html"
+          docker run -d --rm --name statika-smoke \
+            --read-only \
+            --user 10001:10001 \
+            -e STATIKA_ROOT=/srv/www \
+            -v "$RUNNER_TEMP/www:/srv/www:ro" \
+            -p 18080:8080 \
+            statika:test
+          trap 'docker stop statika-smoke >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 50); do
+            if curl --fail --silent http://127.0.0.1:18080/health >/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          test "$(curl --fail --silent http://127.0.0.1:18080/)" = ok

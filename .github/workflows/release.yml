@@ -1,0 +1,132 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+      - name: Validate release tag
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "release tag must be semantic version form: vMAJOR.MINOR.PATCH[-PRERELEASE]" >&2
+            exit 1
+          fi
+      - name: Verify package version matches tag
+        run: |
+          set -euo pipefail
+          package_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [[ "$GITHUB_REF_NAME" != "v${package_version}" ]]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $package_version" >&2
+            exit 1
+          fi
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - name: Build release binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker build --platform linux/amd64 --target builder --tag "statika-builder:${GITHUB_SHA}" .
+          container_id="$(docker create "statika-builder:${GITHUB_SHA}")"
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          docker cp "$container_id:/src/target/release/statika" \
+            "dist/statika-${GITHUB_REF_NAME}-linux-amd64"
+          chmod 0755 "dist/statika-${GITHUB_REF_NAME}-linux-amd64"
+      - name: Build container image archive
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE_LABELS: ${{ steps.meta.outputs.labels }}
+        run: |
+          set -euo pipefail
+          mapfile -t tags <<< "$IMAGE_TAGS"
+          mapfile -t labels <<< "$IMAGE_LABELS"
+          build_args=()
+          for tag in "${tags[@]}"; do
+            build_args+=(--tag "$tag")
+          done
+          for label in "${labels[@]}"; do
+            build_args+=(--label "$label")
+          done
+          docker build --platform linux/amd64 "${build_args[@]}" .
+          docker tag "${tags[0]}" "statika:${GITHUB_REF_NAME}"
+          docker save "statika:${GITHUB_REF_NAME}" | gzip -9 \
+            > "dist/statika-${GITHUB_REF_NAME}-linux-amd64-docker.tar.gz"
+          gzip -t "dist/statika-${GITHUB_REF_NAME}-linux-amd64-docker.tar.gz"
+      - name: Smoke test container
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/www/assets"
+          printf 'ok' > "$RUNNER_TEMP/www/index.html"
+          docker run -d --rm --name statika-smoke \
+            --read-only \
+            --user 10001:10001 \
+            -e STATIKA_ROOT=/srv/www \
+            -v "$RUNNER_TEMP/www:/srv/www:ro" \
+            -p 18080:8080 \
+            "statika:${GITHUB_REF_NAME}"
+          trap 'docker stop statika-smoke >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 50); do
+            if curl --fail --silent http://127.0.0.1:18080/health >/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          test "$(curl --fail --silent http://127.0.0.1:18080/)" = ok
+      - name: Push container image
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            docker push "$tag"
+          done <<< "$IMAGE_TAGS"
+      - name: Create checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > SHA256SUMS
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: statika-${{ github.ref_name }}
+          path: dist/
+          if-no-files-found: error
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --generate-notes \
+            --title "$GITHUB_REF_NAME" \
+            --verify-tag
