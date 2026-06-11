@@ -1,141 +1,97 @@
 # Statika
 
-Statika is a lightweight static file server optimized for containerized deployments and high-throughput static asset delivery.
+Statika is a lightweight Linux static file server optimized for containerized deployments and high-throughput static asset delivery.
 
----
+It serves files. It does not proxy, transform, render, list directories, or execute application code.
 
-## Build
+## Behavior
+
+- `GET` and `HEAD` only.
+- `/health` and `/healthz` return `200 OK`.
+- Missing `/assets/...` paths return `404 Not Found`.
+- Missing non-asset paths fall back to the configured SPA index when it exists.
+- Precompressed `.gz` sidecars are served when the client accepts gzip.
+- Fingerprinted assets such as `app.0123abcd.js` receive immutable one-year caching.
+- Other assets receive one-hour caching.
+- The SPA index and route fallbacks receive `Cache-Control: no-cache`.
+- Files are opened relative to the document-root file descriptor with `O_NOFOLLOW`; symlinks are intentionally rejected.
+- Each connection has a bounded total lifetime from acceptance, including queue wait time.
+- `SIGINT` and `SIGTERM` initiate graceful shutdown.
+
+## Build and test
 
 ```bash
-cargo build --release
-````
-
-## Test
-
-```bash
-cargo test
+cargo test --locked
+cargo build --locked --release
 ```
 
----
+Statika currently targets Linux. The Docker image builds a static musl-linked binary and runs from `scratch` as UID/GID `10001`.
 
-## Run (local)
+## Configuration
+
+`STATIKA_ROOT` is required. All other values have production-safe defaults.
+
+| Variable | Default | Constraint |
+| --- | --- | --- |
+| `STATIKA_ROOT` | required | absolute document-root path |
+| `STATIKA_LISTEN_ADDR` | `0.0.0.0:8080` | socket address |
+| `STATIKA_INDEX` | `index.html` | relative path below root |
+| `STATIKA_ASSETS_PATH` | `/assets` | absolute URL prefix |
+| `STATIKA_THREADS` | available CPUs, capped at `32` | `1..=256` |
+| `STATIKA_QUEUE_SIZE` | `threads * 64` | `1..=65536` |
+| `STATIKA_GZIP` | `true` | boolean |
+| `STATIKA_REQUEST_TIMEOUT_SECS` | `5` | `1..=300` |
+| `STATIKA_SHUTDOWN_TIMEOUT_SECS` | `10` | `1..=300` |
+
+Accepted booleans are `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
+
+## Run locally
 
 ```bash
-export STATIKA_ROOT=/srv/www
-export STATIKA_LISTEN_ADDR=0.0.0.0:8080
-export STATIKA_INDEX=index.html
-export STATIKA_ASSETS_PATH=/assets
-export STATIKA_THREADS=4
-export STATIKA_QUEUE_SIZE=32
-export STATIKA_GZIP=1
-export STATIKA_SHUTDOWN_TIMEOUT_SECS=5
-
-cargo run --release
+STATIKA_ROOT=/srv/www cargo run --locked --release
 ```
 
----
-
-## Docker (local build)
+## Build and run the container
 
 ```bash
 docker build -t statika .
+
 docker run --rm \
   --read-only \
   --user 10001:10001 \
   -e STATIKA_ROOT=/srv/www \
-  -e STATIKA_LISTEN_ADDR=0.0.0.0:8080 \
   -v /srv/www:/srv/www:ro \
   -p 8080:8080 \
   statika
 ```
 
----
+Mount the document root read-only. Statika rejects symlinks, but a read-only mount also prevents accidental runtime mutation.
 
-## GitHub Container Registry (GHCR)
-
-### Pull prebuilt image
-
-```bash
-docker pull ghcr.io/mmrzaf/statika:latest
-```
-
-or pinned version:
-
-```bash
-docker pull ghcr.io/mmrzaf/statika:v0.1.0
-```
-
-### Run from GHCR
-
-```bash
-docker run --rm \
-  --read-only \
-  --user 10001:10001 \
-  -e STATIKA_ROOT=/srv/www \
-  -e STATIKA_LISTEN_ADDR=0.0.0.0:8080 \
-  -v /srv/www:/srv/www:ro \
-  -p 8080:8080 \
-  ghcr.io/mmrzaf/statika:latest
-```
-
----
-
-## Frontend Multi-Stage Deployment (Recommended Pattern)
-
-Statika is designed to serve static assets produced by frontend build pipelines (React, Vue, Svelte, etc.).
-
-### Example Dockerfile
+## Frontend runtime image
 
 ```dockerfile
-# Build frontend
-FROM node:24-alpine AS frontend-builder
+FROM node:24-alpine AS frontend
 WORKDIR /app
-
 COPY package*.json ./
 RUN npm ci
-
 COPY . .
 RUN npm run build
 
-
-# Runtime (Statika from GHCR)
-FROM ghcr.io/mmrzaf/statika:latest
-
-ENV STATIKA_ROOT=/srv/www \
-    STATIKA_LISTEN_ADDR=0.0.0.0:8080 \
-    STATIKA_INDEX=index.html \
-    STATIKA_ASSETS_PATH=/assets
-
-COPY --from=frontend-builder /app/dist/ /srv/www/
-
-EXPOSE 8080
+FROM ghcr.io/OWNER/statika:VERSION
+ENV STATIKA_ROOT=/srv/www
+COPY --from=frontend /app/dist/ /srv/www/
 ```
 
----
+## Release artifacts
 
-## GitHub Actions (CI/CD to GHCR)
+Pushing a `v*` tag runs the release workflow. It verifies the project, publishes the GHCR image, and creates a GitHub Release containing:
 
-Statika images can be automatically built and published:
+- `statika-<tag>-linux-amd64`: static Linux binary.
+- `statika-<tag>-linux-amd64-docker.tar.gz`: Docker image archive.
+- `SHA256SUMS`: checksums for both artifacts.
 
-* Builds on push to `main`
-* Tags on version releases (`v*`)
-* Publishes to GHCR (`ghcr.io/<owner>/statika`)
+Load the downloadable container archive with:
 
-(See `.github/workflows/docker.yml`)
-
----
-
-## Design Notes
-
-* Minimal runtime footprint (`scratch`-based image)
-* Zero Node.js in production images
-* Optimized for immutable deployments
-* Works well in Kubernetes, Docker Swarm, or bare containers
-
+```bash
+docker load < statika-<tag>-linux-amd64-docker.tar.gz
 ```
-
----
-
-If you want, next step is tightening the GHCR strategy further (digest pinning + multi-arch builds + SBOM signing), which is where this becomes enterprise-grade instead of “just working.”
-```
-

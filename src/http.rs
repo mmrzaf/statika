@@ -1,466 +1,400 @@
-use std::io::{self, Read, Write};
-use std::net::SocketAddr;
-use std::os::fd::AsRawFd;
-use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use crate::net;
+use std::fmt::Write as _;
+use std::io::{self, Read};
+use std::net::TcpStream;
+use std::time::Instant;
 
-use crate::ffi;
+const MAX_HEADER_BYTES: usize = 16 * 1024;
 
-pub const HEADER_LIMIT: usize = 8 * 1024;
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Method {
+    Get,
+    Head,
+}
 
-#[derive(Debug)]
-pub enum RequestError {
-    Timeout,
+impl Method {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Head => "HEAD",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Status {
+    Ok,
+    NotModified,
     BadRequest,
+    NotFound,
     MethodNotAllowed,
-    Io(io::Error),
+    RequestTimeout,
+    HeaderTooLarge,
+    InternalServerError,
 }
 
-#[derive(Debug, Clone)]
-pub struct Request {
-    pub target: Vec<u8>,
-    pub accept_gzip: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatusCode {
-    Ok = 200,
-    BadRequest = 400,
-    Forbidden = 403,
-    NotAllowed = 405,
-    InternalServerError = 500,
-}
-
-impl StatusCode {
+impl Status {
     pub fn code(self) -> u16 {
-        self as u16
+        match self {
+            Self::Ok => 200,
+            Self::NotModified => 304,
+            Self::BadRequest => 400,
+            Self::NotFound => 404,
+            Self::MethodNotAllowed => 405,
+            Self::RequestTimeout => 408,
+            Self::HeaderTooLarge => 431,
+            Self::InternalServerError => 500,
+        }
     }
 
-    pub fn reason(self) -> &'static str {
+    fn reason(self) -> &'static str {
         match self {
             Self::Ok => "OK",
+            Self::NotModified => "Not Modified",
             Self::BadRequest => "Bad Request",
-            Self::Forbidden => "Forbidden",
-            Self::NotAllowed => "Method Not Allowed",
+            Self::NotFound => "Not Found",
+            Self::MethodNotAllowed => "Method Not Allowed",
+            Self::RequestTimeout => "Request Timeout",
+            Self::HeaderTooLarge => "Request Header Fields Too Large",
             Self::InternalServerError => "Internal Server Error",
         }
     }
 }
 
-pub fn read_request(stream: &mut std::net::TcpStream) -> Result<Request, RequestError> {
-    let mut buf = [0u8; HEADER_LIMIT];
-    let mut len = 0usize;
-
-    loop {
-        if find_header_end(&buf[..len]).is_some() {
-            break;
-        }
-        if len == buf.len() {
-            return Err(RequestError::BadRequest);
-        }
-        match stream.read(&mut buf[len..]) {
-            Ok(0) => return Err(RequestError::BadRequest),
-            Ok(n) => len += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) if e.kind() == io::ErrorKind::TimedOut => return Err(RequestError::Timeout),
-            Err(e) => return Err(RequestError::Io(e)),
-        }
-    }
-
-    let header_end = find_header_end(&buf[..len]).ok_or(RequestError::BadRequest)?;
-    let headers = &buf[..header_end];
-    parse_request(headers)
+#[derive(Debug)]
+pub struct Request {
+    pub method: Method,
+    pub target: Vec<u8>,
+    pub accept_gzip: bool,
+    pub if_none_match: Option<String>,
 }
 
-fn parse_request(headers: &[u8]) -> Result<Request, RequestError> {
-    let mut lines = headers.split(|b| *b == b'\n');
-    let request_line = lines.next().ok_or(RequestError::BadRequest)?;
-    let request_line = trim_cr(request_line);
+#[derive(Debug)]
+pub enum RequestError {
+    BadRequest,
+    HeaderTooLarge,
+    MethodNotAllowed(String),
+    Timeout,
+    Io,
+}
 
-    let mut parts = request_line.split(|b| *b == b' ');
-    let method = parts.next().ok_or(RequestError::BadRequest)?;
-    let target = parts.next().ok_or(RequestError::BadRequest)?;
-    let version = parts.next().ok_or(RequestError::BadRequest)?;
-    if parts.next().is_some() {
-        return Err(RequestError::BadRequest);
-    }
-    if method != b"GET" {
-        return Err(RequestError::MethodNotAllowed);
-    }
-    if version != b"HTTP/1.1" {
-        return Err(RequestError::BadRequest);
-    }
+#[derive(Debug)]
+pub struct DecodedPath {
+    pub components: Vec<Vec<u8>>,
+    pub trailing_slash: bool,
+}
 
-    let mut accept_gzip = false;
-    for line in lines {
-        let line = trim_cr(line);
-        if line.is_empty() {
-            continue;
+pub fn read_request(stream: &mut TcpStream, deadline: Instant) -> Result<Request, RequestError> {
+    let mut request = Vec::with_capacity(1024);
+    let mut chunk = [0_u8; 1024];
+
+    let header_end = loop {
+        if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
         }
-        if let Some((name, value)) = split_header(line)? {
-            if eq_ignore_ascii_case(name, b"accept-encoding") && header_accepts_gzip(value) {
-                accept_gzip = true;
+        if request.len() >= MAX_HEADER_BYTES {
+            return Err(RequestError::HeaderTooLarge);
+        }
+
+        match stream.read(&mut chunk) {
+            Ok(0) => return Err(RequestError::BadRequest),
+            Ok(read) => {
+                if request.len() + read > MAX_HEADER_BYTES {
+                    return Err(RequestError::HeaderTooLarge);
+                }
+                request.extend_from_slice(&chunk[..read]);
             }
-        } else {
-            return Err(RequestError::BadRequest);
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                net::wait_readable(stream, deadline).map_err(map_io)?;
+            }
+            Err(error) => return Err(map_io(error)),
+        }
+    };
+
+    parse_request(&request[..header_end])
+}
+
+fn parse_request(header: &[u8]) -> Result<Request, RequestError> {
+    let mut lines = header.split(|byte| *byte == b'\n');
+    let request_line = lines.next().ok_or(RequestError::BadRequest)?;
+    let request_line = request_line
+        .strip_suffix(b"\r")
+        .ok_or(RequestError::BadRequest)?;
+    let mut fields = request_line.split(|byte| *byte == b' ');
+    let method_raw = fields.next().ok_or(RequestError::BadRequest)?;
+    let target = fields.next().ok_or(RequestError::BadRequest)?;
+    let version = fields.next().ok_or(RequestError::BadRequest)?;
+    if fields.next().is_some() || target.is_empty() || !target.starts_with(b"/") {
+        return Err(RequestError::BadRequest);
+    }
+    if version != b"HTTP/1.1" && version != b"HTTP/1.0" {
+        return Err(RequestError::BadRequest);
+    }
+
+    let method = match method_raw {
+        b"GET" => Method::Get,
+        b"HEAD" => Method::Head,
+        _ => {
+            return Err(RequestError::MethodNotAllowed(
+                String::from_utf8_lossy(method_raw).into_owned(),
+            ))
+        }
+    };
+
+    let mut accept_encoding = Vec::new();
+    let mut if_none_match = None;
+    for line in lines {
+        let line = line.strip_suffix(b"\r").ok_or(RequestError::BadRequest)?;
+        if line.is_empty() {
+            break;
+        }
+        let colon = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .ok_or(RequestError::BadRequest)?;
+        let name = trim_ascii(&line[..colon]);
+        let value = trim_ascii(&line[colon + 1..]);
+        if name.eq_ignore_ascii_case(b"accept-encoding") {
+            accept_encoding.extend_from_slice(value);
+            accept_encoding.push(b',');
+        } else if name.eq_ignore_ascii_case(b"if-none-match") {
+            if_none_match = Some(String::from_utf8_lossy(value).into_owned());
         }
     }
 
     Ok(Request {
+        method,
         target: target.to_vec(),
-        accept_gzip,
+        accept_gzip: accepts_gzip(&accept_encoding),
+        if_none_match,
     })
 }
 
-fn split_header(line: &[u8]) -> Result<Option<(&[u8], &[u8])>, RequestError> {
-    let mut parts = line.splitn(2, |b| *b == b':');
-    let name = parts.next().ok_or(RequestError::BadRequest)?;
-    let value = parts.next().ok_or(RequestError::BadRequest)?;
-    Ok(Some((trim_ws(name), trim_ws(value))))
-}
-
-fn header_accepts_gzip(value: &[u8]) -> bool {
-    value
-        .split(|b| *b == b',')
-        .any(|part| trim_ws(part).eq_ignore_ascii_case(b"gzip"))
-}
-
-pub fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
-}
-
-pub fn trim_ws(input: &[u8]) -> &[u8] {
-    let mut start = 0usize;
-    let mut end = input.len();
-    while start < end && (input[start] == b' ' || input[start] == b'\t') {
-        start += 1;
-    }
-    while end > start && (input[end - 1] == b' ' || input[end - 1] == b'\t') {
-        end -= 1;
-    }
-    &input[start..end]
-}
-
-fn trim_cr(input: &[u8]) -> &[u8] {
-    if input.ends_with(b"\r") {
-        &input[..input.len() - 1]
-    } else {
-        input
-    }
-}
-
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
-}
-
-pub fn read_request_target(raw_target: &[u8]) -> Result<Vec<u8>, RequestError> {
-    let path = match raw_target.iter().position(|b| *b == b'?') {
-        Some(idx) => &raw_target[..idx],
-        None => raw_target,
-    };
-    if path.is_empty() || path[0] != b'/' {
+pub fn decode_target(target: &[u8]) -> Result<DecodedPath, RequestError> {
+    let path = target.split(|byte| *byte == b'?').next().unwrap_or(target);
+    if !path.starts_with(b"/") {
         return Err(RequestError::BadRequest);
     }
-    percent_decode(path)
-}
 
-pub fn percent_decode(input: &[u8]) -> Result<Vec<u8>, RequestError> {
-    let mut out = Vec::with_capacity(input.len());
-    let mut i = 0usize;
-    while i < input.len() {
-        match input[i] {
+    let trailing_slash = path.ends_with(b"/");
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut cursor = 0;
+    while cursor < path.len() {
+        match path[cursor] {
             b'%' => {
-                if i + 2 >= input.len() {
+                if cursor + 2 >= path.len() {
                     return Err(RequestError::BadRequest);
                 }
-                let hi = hex_value(input[i + 1]).ok_or(RequestError::BadRequest)?;
-                let lo = hex_value(input[i + 2]).ok_or(RequestError::BadRequest)?;
-                let byte = (hi << 4) | lo;
-                if byte == 0 {
-                    return Err(RequestError::BadRequest);
-                }
-                out.push(byte);
-                i += 3;
+                let high = hex(path[cursor + 1]).ok_or(RequestError::BadRequest)?;
+                let low = hex(path[cursor + 2]).ok_or(RequestError::BadRequest)?;
+                decoded.push((high << 4) | low);
+                cursor += 3;
             }
-            b => {
-                if b == 0 {
-                    return Err(RequestError::BadRequest);
-                }
-                out.push(b);
-                i += 1;
+            byte => {
+                decoded.push(byte);
+                cursor += 1;
             }
         }
     }
-    Ok(out)
+
+    if decoded.contains(&0) || decoded.contains(&b'\\') {
+        return Err(RequestError::BadRequest);
+    }
+
+    let mut components = Vec::new();
+    for component in decoded.split(|byte| *byte == b'/') {
+        if component.is_empty() {
+            continue;
+        }
+        if component == b"." || component == b".." {
+            return Err(RequestError::BadRequest);
+        }
+        components.push(component.to_vec());
+    }
+
+    Ok(DecodedPath {
+        components,
+        trailing_slash,
+    })
 }
 
-fn hex_value(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
+pub fn if_none_match_matches(value: Option<&str>, etag: &str) -> bool {
+    value.is_some_and(|header| {
+        header.split(',').any(|candidate| {
+            let candidate = candidate.trim();
+            candidate == "*" || candidate == etag || candidate.strip_prefix("W/") == Some(etag)
+        })
+    })
+}
+
+pub fn response_head(
+    status: Status,
+    content_length: u64,
+    content_type: Option<&str>,
+    headers: &[(&str, &str)],
+) -> Vec<u8> {
+    let mut response = String::with_capacity(512);
+    let _ = write!(
+        response,
+        "HTTP/1.1 {} {}\r\n",
+        status.code(),
+        status.reason()
+    );
+    response.push_str("Server: statika\r\n");
+    response.push_str("Connection: close\r\n");
+    response.push_str("X-Content-Type-Options: nosniff\r\n");
+    let _ = write!(response, "Content-Length: {content_length}\r\n");
+    if let Some(content_type) = content_type {
+        let _ = write!(response, "Content-Type: {content_type}\r\n");
+    }
+    for (name, value) in headers {
+        let _ = write!(response, "{name}: {value}\r\n");
+    }
+    response.push_str("\r\n");
+    response.into_bytes()
+}
+
+pub fn content_type(components: &[Vec<u8>]) -> &'static str {
+    let extension = components
+        .last()
+        .and_then(|name| name.rsplit(|byte| *byte == b'.').next())
+        .unwrap_or_default();
+
+    if extension.eq_ignore_ascii_case(b"html") || extension.eq_ignore_ascii_case(b"htm") {
+        "text/html; charset=utf-8"
+    } else if extension.eq_ignore_ascii_case(b"css") {
+        "text/css; charset=utf-8"
+    } else if extension.eq_ignore_ascii_case(b"js") || extension.eq_ignore_ascii_case(b"mjs") {
+        "text/javascript; charset=utf-8"
+    } else if extension.eq_ignore_ascii_case(b"json") || extension.eq_ignore_ascii_case(b"map") {
+        "application/json; charset=utf-8"
+    } else if extension.eq_ignore_ascii_case(b"svg") {
+        "image/svg+xml"
+    } else if extension.eq_ignore_ascii_case(b"png") {
+        "image/png"
+    } else if extension.eq_ignore_ascii_case(b"jpg") || extension.eq_ignore_ascii_case(b"jpeg") {
+        "image/jpeg"
+    } else if extension.eq_ignore_ascii_case(b"gif") {
+        "image/gif"
+    } else if extension.eq_ignore_ascii_case(b"webp") {
+        "image/webp"
+    } else if extension.eq_ignore_ascii_case(b"ico") {
+        "image/x-icon"
+    } else if extension.eq_ignore_ascii_case(b"woff") {
+        "font/woff"
+    } else if extension.eq_ignore_ascii_case(b"woff2") {
+        "font/woff2"
+    } else if extension.eq_ignore_ascii_case(b"txt") {
+        "text/plain; charset=utf-8"
+    } else if extension.eq_ignore_ascii_case(b"xml") {
+        "application/xml; charset=utf-8"
+    } else if extension.eq_ignore_ascii_case(b"wasm") {
+        "application/wasm"
+    } else if extension.eq_ignore_ascii_case(b"pdf") {
+        "application/pdf"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+pub fn has_fingerprint(components: &[Vec<u8>]) -> bool {
+    components.last().is_some_and(|name| {
+        name.split(|byte| matches!(*byte, b'.' | b'-' | b'_'))
+            .any(|part| part.len() >= 8 && part.iter().all(u8::is_ascii_hexdigit))
+    })
+}
+
+fn accepts_gzip(value: &[u8]) -> bool {
+    let mut gzip = None;
+    let mut wildcard = None;
+    for raw_item in value.split(|byte| *byte == b',') {
+        let mut fields = raw_item.split(|byte| *byte == b';');
+        let token = trim_ascii(fields.next().unwrap_or_default());
+        if token.is_empty() {
+            continue;
+        }
+        let mut quality = 1.0_f32;
+        for field in fields {
+            let field = trim_ascii(field);
+            if field.len() >= 2 && field[..2].eq_ignore_ascii_case(b"q=") {
+                quality = std::str::from_utf8(&field[2..])
+                    .ok()
+                    .and_then(|text| text.parse::<f32>().ok())
+                    .filter(|quality| (0.0..=1.0).contains(quality))
+                    .unwrap_or(0.0);
+            }
+        }
+        if token.eq_ignore_ascii_case(b"gzip") {
+            gzip = Some(quality);
+        } else if token == b"*" {
+            wildcard = Some(quality);
+        }
+    }
+    gzip.or(wildcard).unwrap_or(0.0) > 0.0
+}
+
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+fn hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
 }
 
-pub fn normalize_path(decoded: &[u8]) -> Result<Vec<Vec<u8>>, RequestError> {
-    let mut segments: Vec<Vec<u8>> = Vec::new();
-    for seg in decoded.split(|b| *b == b'/') {
-        if seg.is_empty() || seg == b"." {
-            continue;
-        }
-        if seg == b".." {
-            segments.pop();
-            continue;
-        }
-        if seg.iter().any(|b| *b == 0) {
-            return Err(RequestError::BadRequest);
-        }
-        segments.push(seg.to_vec());
-    }
-    Ok(segments)
-}
-
-pub fn is_health_endpoint(path: &[u8]) -> bool {
-    path == b"/health"
-}
-
-pub fn write_simple_response(
-    stream: &mut std::net::TcpStream,
-    status: StatusCode,
-    body: &[u8],
-    extra_headers: &[(&str, &str)],
-) -> io::Result<u64> {
-    let mut header = Vec::with_capacity(256);
-    header.extend_from_slice(b"HTTP/1.1 ");
-    header.extend_from_slice(status.code().to_string().as_bytes());
-    header.push(b' ');
-    header.extend_from_slice(status.reason().as_bytes());
-    header.extend_from_slice(b"\r\nConnection: close\r\nContent-Length: ");
-    header.extend_from_slice(body.len().to_string().as_bytes());
-    header.extend_from_slice(b"\r\n");
-    for (k, v) in extra_headers {
-        header.extend_from_slice(k.as_bytes());
-        header.extend_from_slice(b": ");
-        header.extend_from_slice(v.as_bytes());
-        header.extend_from_slice(b"\r\n");
-    }
-    header.extend_from_slice(b"\r\n");
-    stream.write_all(&header)?;
-    stream.write_all(body)?;
-    Ok(header.len() as u64 + body.len() as u64)
-}
-
-pub fn write_file_response(
-    stream: &mut std::net::TcpStream,
-    status: StatusCode,
-    content_length: u64,
-    mime: &str,
-    cache_immutable: bool,
-    gzip: bool,
-    file: &std::fs::File,
-) -> io::Result<u64> {
-    let mut header = Vec::with_capacity(256);
-    header.extend_from_slice(b"HTTP/1.1 ");
-    header.extend_from_slice(status.code().to_string().as_bytes());
-    header.push(b' ');
-    header.extend_from_slice(status.reason().as_bytes());
-    header.extend_from_slice(b"\r\nConnection: close\r\nContent-Length: ");
-    header.extend_from_slice(content_length.to_string().as_bytes());
-    header.extend_from_slice(b"\r\nContent-Type: ");
-    header.extend_from_slice(mime.as_bytes());
-    header.extend_from_slice(b"\r\n");
-    if gzip {
-        header.extend_from_slice(b"Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n");
-    }
-    if cache_immutable {
-        header.extend_from_slice(b"Cache-Control: public, max-age=31536000, immutable\r\n");
-    }
-    header.extend_from_slice(b"\r\n");
-    stream.write_all(&header)?;
-    let body_bytes = send_file(stream, file, content_length)?;
-    Ok(header.len() as u64 + body_bytes)
-}
-
-pub fn send_file(
-    stream: &mut std::net::TcpStream,
-    file: &std::fs::File,
-    mut count: u64,
-) -> io::Result<u64> {
-    let mut sent = 0u64;
-    let out_fd = stream.as_raw_fd();
-    let in_fd = file.as_raw_fd();
-
-    while count > 0 {
-        let to_send = count.min(usize::MAX as u64) as usize;
-        let mut offset: ffi::off_t = sent as ffi::off_t;
-        let rc = unsafe { ffi::sendfile(out_fd, in_fd, &mut offset as *mut ffi::off_t, to_send) };
-        if rc > 0 {
-            let n = rc as u64;
-            sent += n;
-            count -= n;
-            continue;
-        }
-        if rc == 0 {
-            break;
-        }
-        let err = io::Error::last_os_error();
-        match err.kind() {
-            io::ErrorKind::Interrupted => continue,
-            io::ErrorKind::WouldBlock => continue,
-            io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported if sent == 0 => {
-                let mut reader = file;
-                let copied = io::copy(&mut reader, stream)?;
-                return Ok(copied);
-            }
-            _ => return Err(err),
-        }
-    }
-    Ok(sent)
-}
-
-pub fn log_request(
-    remote: Option<SocketAddr>,
-    method: &str,
-    path: &str,
-    status: StatusCode,
-    bytes: u64,
-    duration: Duration,
-    error: Option<&str>,
-) {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let mut line = String::with_capacity(256);
-    line.push('{');
-    push_json_kv_u128(&mut line, "ts", ts);
-    push_json_kv_str(
-        &mut line,
-        "remote",
-        remote.map(|r| r.to_string()).as_deref().unwrap_or(""),
-    );
-    push_json_kv_str(&mut line, "method", method);
-    push_json_kv_str(&mut line, "path", path);
-    push_json_kv_u64(&mut line, "status", status.code() as u64);
-    push_json_kv_u64(&mut line, "bytes", bytes);
-    push_json_kv_u64(&mut line, "duration_ms", duration.as_millis() as u64);
-    if let Some(err) = error {
-        push_json_kv_str(&mut line, "error", err);
-    } else if line.ends_with(',') {
-        line.pop();
-    }
-    if line.ends_with(',') {
-        line.pop();
-    }
-    line.push('}');
-    let mut stderr = io::stderr().lock();
-    let _ = stderr.write_all(line.as_bytes());
-    let _ = stderr.write_all(b"\n");
-}
-
-fn push_json_kv_str(line: &mut String, key: &str, value: &str) {
-    line.push('"');
-    line.push_str(key);
-    line.push_str("\":\"");
-    escape_json_string(line, value);
-    line.push_str("\",");
-}
-
-fn push_json_kv_u64(line: &mut String, key: &str, value: u64) {
-    line.push('"');
-    line.push_str(key);
-    line.push_str("\":");
-    line.push_str(&value.to_string());
-    line.push(',');
-}
-
-fn push_json_kv_u128(line: &mut String, key: &str, value: u128) {
-    line.push('"');
-    line.push_str(key);
-    line.push_str("\":");
-    line.push_str(&value.to_string());
-    line.push(',');
-}
-
-fn escape_json_string(out: &mut String, input: &str) {
-    for ch in input.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
-                let _ = std::fmt::Write::write_fmt(out, format_args!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-}
-
-pub fn mime_for_path(path: &Path) -> &'static str {
-    match path.extension().and_then(|s| s.to_str()).unwrap_or("") {
-        "html" | "htm" => "text/html; charset=utf-8",
-        "css" => "text/css; charset=utf-8",
-        "js" => "application/javascript; charset=utf-8",
-        "mjs" => "application/javascript; charset=utf-8",
-        "json" => "application/json; charset=utf-8",
-        "svg" => "image/svg+xml",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "ico" => "image/x-icon",
-        "txt" => "text/plain; charset=utf-8",
-        "xml" => "application/xml; charset=utf-8",
-        "wasm" => "application/wasm",
-        _ => "application/octet-stream",
+fn map_io(error: io::Error) -> RequestError {
+    if error.kind() == io::ErrorKind::TimedOut {
+        RequestError::Timeout
+    } else {
+        RequestError::Io
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{accepts_gzip, decode_target, has_fingerprint, if_none_match_matches};
 
     #[test]
-    fn percent_decode_valid() {
-        let out = percent_decode(b"/a%20b/c").unwrap();
-        assert_eq!(out, b"/a b/c");
+    fn gzip_quality_is_respected() {
+        assert!(accepts_gzip(b"br, gzip;q=1.0"));
+        assert!(!accepts_gzip(b"gzip;q=0, *;q=1"));
+        assert!(accepts_gzip(b"*;q=0.5"));
     }
 
     #[test]
-    fn percent_decode_invalid() {
-        assert!(matches!(
-            percent_decode(b"/%ZZ"),
-            Err(RequestError::BadRequest)
-        ));
-        assert!(matches!(
-            percent_decode(b"/%00"),
-            Err(RequestError::BadRequest)
-        ));
+    fn target_decode_rejects_escapes() {
+        assert!(decode_target(b"/%2e%2e/secret").is_err());
+        assert!(decode_target(b"/assets/%00.js").is_err());
+        assert_eq!(
+            decode_target(b"/route?q=1").unwrap().components,
+            vec![b"route".to_vec()]
+        );
     }
 
     #[test]
-    fn normalize_path_drops_dots() {
-        let decoded = b"/a/./b/../c";
-        let segs = normalize_path(decoded).unwrap();
-        let rendered: Vec<Vec<u8>> = segs;
-        assert_eq!(rendered, vec![b"a".to_vec(), b"c".to_vec()]);
+    fn fingerprint_detection_is_conservative() {
+        assert!(has_fingerprint(&[
+            b"assets".to_vec(),
+            b"app.0123abcd.js".to_vec()
+        ]));
+        assert!(!has_fingerprint(&[b"assets".to_vec(), b"app.js".to_vec()]));
     }
 
     #[test]
-    fn request_target_requires_origin_form() {
-        assert!(matches!(
-            read_request_target(b"http://example.com/"),
-            Err(RequestError::BadRequest)
-        ));
-    }
-
-    #[test]
-    fn gzip_header_detection() {
-        assert!(header_accepts_gzip(b"br, gzip, deflate"));
-        assert!(!header_accepts_gzip(b"br, deflate"));
+    fn weak_etag_matches() {
+        assert!(if_none_match_matches(Some("W/\"abc\""), "\"abc\""));
+        assert!(if_none_match_matches(Some("*"), "\"abc\""));
+        assert!(!if_none_match_matches(Some("\"def\""), "\"abc\""));
     }
 }

@@ -1,15 +1,13 @@
-FROM rust:1-alpine AS builder
+FROM rust:1.96.0-alpine AS builder
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY tests ./tests
-
-RUN rustup target add x86_64-unknown-linux-musl
-RUN cargo build --release --target x86_64-unknown-linux-musl
+RUN cargo build --locked --release
 
 FROM scratch
-COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/statika /statika
+COPY --from=builder /src/target/release/statika /statika
 USER 10001:10001
+EXPOSE 8080
 ENTRYPOINT ["/statika"]

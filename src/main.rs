@@ -1,18 +1,22 @@
-use std::process;
+#[cfg(not(target_os = "linux"))]
+compile_error!("statika currently supports Linux only");
 
-use statika::{run, Config};
+mod config;
+mod fs;
+mod http;
+mod net;
+mod server;
+
+use config::Config;
 
 fn main() {
-    match Config::from_env() {
-        Ok(cfg) => {
-            if let Err(err) = run(cfg) {
-                eprintln!("{err}");
-                process::exit(1);
-            }
-        }
-        Err(err) => {
-            eprintln!("{err}");
-            process::exit(1);
-        }
+    let config = Config::from_env().unwrap_or_else(|error| {
+        eprintln!("configuration error: {error}");
+        std::process::exit(2);
+    });
+
+    if let Err(error) = server::run(config) {
+        eprintln!("server error: {error}");
+        std::process::exit(1);
     }
 }

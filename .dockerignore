@@ -1,0 +1,11 @@
+.git
+.github
+target
+*.tar
+*.tar.gz
+*.zip
+.DS_Store
+.idea
+.vscode
+.snip.yaml
+dist
