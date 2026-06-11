@@ -1,12 +1,17 @@
 [package]
 name = "statika"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+rust-version = "1.85"
 license = "MIT"
+description = "A lightweight static file server for containerized deployments"
 
 [[bin]]
 name = "statika"
 path = "src/main.rs"
+
+[dependencies]
+libc = "=0.2.186"
 
 [profile.release]
 codegen-units = 1
