@@ -352,5 +352,5 @@ fn prints_version_without_configuration() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "statika 0.3.0\n");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "statika 0.3.2\n");
 }
