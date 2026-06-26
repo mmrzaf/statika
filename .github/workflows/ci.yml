@@ -19,8 +19,16 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
         run: cargo test --locked
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Dependency audit
+        run: cargo audit --locked
       - name: Build container
-        run: docker build -t statika:test .
+        run: |
+          docker build \
+            --build-arg VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)" \
+            --build-arg REVISION="${GITHUB_SHA}" \
+            -t statika:test .
       - name: Smoke test container
         run: |
           set -euo pipefail
@@ -28,6 +36,8 @@ jobs:
           printf 'ok' > "$RUNNER_TEMP/www/index.html"
           docker run -d --rm --name statika-smoke \
             --read-only \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
             --user 10001:10001 \
             -e STATIKA_ROOT=/srv/www \
             -v "$RUNNER_TEMP/www:/srv/www:ro" \
@@ -41,3 +51,4 @@ jobs:
             sleep 0.1
           done
           test "$(curl --fail --silent http://127.0.0.1:18080/)" = ok
+          docker run --rm --entrypoint /statika statika:test --version

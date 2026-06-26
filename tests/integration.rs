@@ -22,10 +22,14 @@ fn fixture() -> PathBuf {
         .as_nanos();
     let root = std::env::temp_dir().join(format!("statika-it-{}-{suffix}", std::process::id()));
     fs::create_dir_all(root.join("assets")).unwrap();
+    fs::create_dir_all(root.join(".well-known/acme-challenge")).unwrap();
     fs::write(root.join("index.html"), b"INDEX").unwrap();
     fs::write(root.join("assets/app.js"), b"plain-app").unwrap();
     fs::write(root.join("assets/app.js.gz"), b"gzip-app").unwrap();
+    fs::write(root.join("assets/app.js.br"), b"br-app").unwrap();
     fs::write(root.join("assets/app.0123abcd.js"), b"hashed-app").unwrap();
+    fs::write(root.join(".env"), b"secret").unwrap();
+    fs::write(root.join(".well-known/acme-challenge/token"), b"token").unwrap();
     root
 }
 
@@ -36,6 +40,8 @@ fn spawn_server(root: &Path, port: u16) -> Child {
         .env("STATIKA_THREADS", "2")
         .env("STATIKA_QUEUE_SIZE", "4")
         .env("STATIKA_GZIP", "1")
+        .env("STATIKA_BROTLI", "1")
+        .env("STATIKA_DENY_DOTFILES", "1")
         .env("STATIKA_REQUEST_TIMEOUT_SECS", "1")
         .env("STATIKA_SHUTDOWN_TIMEOUT_SECS", "3")
         .stdout(Stdio::null())
@@ -100,7 +106,7 @@ fn stop(child: &mut Child) {
 }
 
 #[test]
-fn serves_health_spa_assets_head_gzip_and_etag() {
+fn serves_health_spa_assets_head_encodings_and_conditionals() {
     let root = fixture();
     let port = free_port();
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -116,13 +122,47 @@ fn serves_health_spa_assets_head_gzip_and_etag() {
 
     let (head, body) = request(
         addr,
-        "GET /assets/app.js HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip;q=1.0\r\n\r\n",
+        concat!(
+            "GET /assets/app.js HTTP/1.1\r\n",
+            "Host: localhost\r\n",
+            "Accept-Encoding: br, gzip;q=1.0\r\n",
+            "\r\n"
+        ),
+    );
+    assert!(head.starts_with("HTTP/1.1 200 OK"));
+    assert!(head.contains("Content-Encoding: br"));
+    assert!(head.contains("Vary: Accept-Encoding"));
+    assert!(head.contains("Cache-Control: public, max-age=3600"));
+    assert!(head.contains("Last-Modified: "));
+    assert_eq!(body, b"br-app");
+    let etag = header(&head, "ETag").unwrap().to_owned();
+    let last_modified = header(&head, "Last-Modified").unwrap().to_owned();
+
+    let (head, body) = request(
+        addr,
+        concat!(
+            "GET /assets/app.js HTTP/1.1\r\n",
+            "Host: localhost\r\n",
+            "Accept-Encoding: gzip;q=1.0, br;q=0\r\n",
+            "\r\n"
+        ),
     );
     assert!(head.starts_with("HTTP/1.1 200 OK"));
     assert!(head.contains("Content-Encoding: gzip"));
-    assert!(head.contains("Cache-Control: public, max-age=3600"));
     assert_eq!(body, b"gzip-app");
-    let etag = header(&head, "ETag").unwrap().to_owned();
+
+    let (head, body) = request(
+        addr,
+        concat!(
+            "GET /assets/app.js HTTP/1.1\r\n",
+            "Host: localhost\r\n",
+            "Accept-Encoding: gzip;q=0, br;q=0\r\n",
+            "\r\n"
+        ),
+    );
+    assert!(head.starts_with("HTTP/1.1 200 OK"));
+    assert!(!head.contains("Content-Encoding:"));
+    assert_eq!(body, b"plain-app");
 
     let (head, body) = request(
         addr,
@@ -130,7 +170,7 @@ fn serves_health_spa_assets_head_gzip_and_etag() {
             concat!(
                 "GET /assets/app.js HTTP/1.1\r\n",
                 "Host: localhost\r\n",
-                "Accept-Encoding: gzip;q=1.0\r\n",
+                "Accept-Encoding: br\r\n",
                 "If-None-Match: {}\r\n",
                 "\r\n"
             ),
@@ -138,7 +178,22 @@ fn serves_health_spa_assets_head_gzip_and_etag() {
         ),
     );
     assert!(head.starts_with("HTTP/1.1 304 Not Modified"));
-    assert_eq!(header(&head, "Content-Length"), Some("8"));
+    assert!(body.is_empty());
+
+    let (head, body) = request(
+        addr,
+        &format!(
+            concat!(
+                "GET /assets/app.js HTTP/1.1\r\n",
+                "Host: localhost\r\n",
+                "Accept-Encoding: br\r\n",
+                "If-Modified-Since: {}\r\n",
+                "\r\n"
+            ),
+            last_modified
+        ),
+    );
+    assert!(head.starts_with("HTTP/1.1 304 Not Modified"));
     assert!(body.is_empty());
 
     let (head, body) = request(
@@ -169,14 +224,21 @@ fn serves_health_spa_assets_head_gzip_and_etag() {
 }
 
 #[test]
-fn rejects_asset_fallback_symlinks_and_unsupported_methods() {
+fn rejects_asset_fallback_symlinks_dotfiles_bad_targets_and_unsupported_methods() {
     let root = fixture();
     let outside = root.parent().unwrap().join(format!(
         "{}-outside.txt",
         root.file_name().unwrap().to_string_lossy()
     ));
+    let outside_dir = root.parent().unwrap().join(format!(
+        "{}-outside-dir",
+        root.file_name().unwrap().to_string_lossy()
+    ));
     fs::write(&outside, b"secret").unwrap();
+    fs::create_dir_all(&outside_dir).unwrap();
+    fs::write(outside_dir.join("secret.txt"), b"secret").unwrap();
     symlink(&outside, root.join("assets/escape.txt")).unwrap();
+    symlink(&outside_dir, root.join("assets/linked-dir")).unwrap();
 
     let port = free_port();
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -197,13 +259,58 @@ fn rejects_asset_fallback_symlinks_and_unsupported_methods() {
     assert!(head.starts_with("HTTP/1.1 404 Not Found"));
     assert_eq!(body, b"not found\n");
 
+    let (head, body) = request(
+        addr,
+        "GET /assets/linked-dir/secret.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(head.starts_with("HTTP/1.1 404 Not Found"));
+    assert_eq!(body, b"not found\n");
+
+    for target in [
+        "/%2e%2e/secret",
+        "/assets/%2e%2e/secret",
+        "/assets%2f..%2fsecret",
+        "/assets/%00.js",
+    ] {
+        let (head, _) = request(
+            addr,
+            &format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+        );
+        assert!(
+            head.starts_with("HTTP/1.1 400 Bad Request"),
+            "{target}: {head}"
+        );
+    }
+
+    let (head, body) = request(addr, "GET /.env HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(head.starts_with("HTTP/1.1 404 Not Found"));
+    assert_eq!(body, b"not found\n");
+
+    let (head, body) = request(
+        addr,
+        "GET /.well-known/acme-challenge/token HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(head.starts_with("HTTP/1.1 200 OK"));
+    assert_eq!(body, b"token");
+
+    let (head, _) = request(addr, "GET /health HTTP/1.1\r\n\r\n");
+    assert!(head.starts_with("HTTP/1.1 400 Bad Request"));
+
     let (head, _) = request(addr, "POST /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert!(head.starts_with("HTTP/1.1 405 Method Not Allowed"));
     assert!(head.contains("Allow: GET, HEAD"));
 
+    let (head, body) = request(
+        addr,
+        "HEAD /assets/missing.js HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(head.starts_with("HTTP/1.1 404 Not Found"));
+    assert!(body.is_empty());
+
     stop(&mut child);
     fs::remove_dir_all(root).unwrap();
     fs::remove_file(outside).unwrap();
+    fs::remove_dir_all(outside_dir).unwrap();
 }
 
 #[test]
@@ -227,4 +334,23 @@ fn rejects_invalid_configuration() {
         .status()
         .unwrap();
     assert_eq!(status.code(), Some(2));
+
+    let status = Command::new(env!("CARGO_BIN_EXE_statika"))
+        .env("STATIKA_ROOT", std::env::temp_dir())
+        .env("STATIKA_EXTRA_HEADERS", "Content-Length: 7")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(2));
+}
+
+#[test]
+fn prints_version_without_configuration() {
+    let output = Command::new(env!("CARGO_BIN_EXE_statika"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "statika 0.3.0\n");
 }
