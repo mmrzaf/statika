@@ -109,7 +109,7 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
-FROM ghcr.io/OWNER/statika:VERSION
+FROM ghcr.io/mmrzaf/statika:VERSION
 ENV STATIKA_ROOT=/srv/www
 COPY --from=frontend /app/dist/ /srv/www/
 ```

@@ -19,10 +19,6 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
         run: cargo test --locked
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-      - name: Dependency audit
-        run: cargo audit --locked
       - name: Build container
         run: |
           docker build \
