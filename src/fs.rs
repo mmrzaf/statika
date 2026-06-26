@@ -61,6 +61,14 @@ impl RootDir {
     }
 }
 
+pub fn br_path(components: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut br = components.to_vec();
+    if let Some(last) = br.last_mut() {
+        last.extend_from_slice(b".br");
+    }
+    br
+}
+
 pub fn gzip_path(components: &[Vec<u8>]) -> Vec<Vec<u8>> {
     let mut gzip = components.to_vec();
     if let Some(last) = gzip.last_mut() {
