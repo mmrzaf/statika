@@ -1,7 +1,7 @@
-use crate::config::Config;
-use crate::fs::{gzip_path, is_not_found, RootDir};
+use crate::config::{Config, Header};
+use crate::fs::{br_path, gzip_path, is_not_found, RootDir};
 use crate::http::{
-    content_type, decode_target, has_fingerprint, if_none_match_matches, read_request,
+    content_type, decode_target, has_fingerprint, http_date, if_none_match_matches, read_request,
     response_head, DecodedPath, Method, Request, RequestError, Status,
 };
 use crate::net;
@@ -227,6 +227,24 @@ struct ResponseContext<'a> {
     deadline: Instant,
     method: Method,
     path: &'a str,
+    extra_headers: &'a [Header],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepresentationEncoding {
+    Identity,
+    Br,
+    Gzip,
+}
+
+impl RepresentationEncoding {
+    fn header_value(self) -> Option<&'static str> {
+        match self {
+            Self::Identity => None,
+            Self::Br => Some("br"),
+            Self::Gzip => Some("gzip"),
+        }
+    }
 }
 
 fn handle_connection(
@@ -243,6 +261,7 @@ fn handle_connection(
             "",
             Status::RequestTimeout,
             "queue_timeout",
+            config.extra_headers(),
         );
     }
 
@@ -256,6 +275,7 @@ fn handle_connection(
                 "",
                 Status::BadRequest,
                 "bad_request",
+                config.extra_headers(),
             )
         }
         Err(RequestError::HeaderTooLarge) => {
@@ -266,6 +286,7 @@ fn handle_connection(
                 "",
                 Status::HeaderTooLarge,
                 "header_too_large",
+                config.extra_headers(),
             )
         }
         Err(RequestError::MethodNotAllowed(method)) => {
@@ -276,6 +297,7 @@ fn handle_connection(
                 "",
                 Status::MethodNotAllowed,
                 "method_not_allowed",
+                config.extra_headers(),
             )
         }
         Err(RequestError::Timeout) => {
@@ -286,6 +308,7 @@ fn handle_connection(
                 "",
                 Status::RequestTimeout,
                 "timeout",
+                config.extra_headers(),
             )
         }
         Err(RequestError::Io) => {
@@ -304,16 +327,19 @@ fn handle_connection(
                 &path_for_log,
                 Status::BadRequest,
                 "bad_target",
+                config.extra_headers(),
             )
         }
     };
 
+    let response = ResponseContext {
+        deadline,
+        method: request.method,
+        path: &path_for_log,
+        extra_headers: config.extra_headers(),
+    };
+
     if is_health_path(&decoded.components) {
-        let response = ResponseContext {
-            deadline,
-            method: request.method,
-            path: &path_for_log,
-        };
         return simple_response(
             stream,
             &response,
@@ -324,11 +350,6 @@ fn handle_connection(
         );
     }
 
-    let response = ResponseContext {
-        deadline,
-        method: request.method,
-        path: &path_for_log,
-    };
     serve_static(stream, root, config, request, decoded, &response)
 }
 
@@ -346,17 +367,44 @@ fn serve_static(
         components.extend_from_slice(config.index());
     }
 
-    let (file, served_components, compressed, fallback) = match open_representation(
+    if config.deny_dotfiles() && contains_denied_dotfile(&components) {
+        return simple_error(
+            stream,
+            response.deadline,
+            request.method.as_str(),
+            response.path,
+            Status::NotFound,
+            "dotfile_denied",
+            response.extra_headers,
+        );
+    }
+
+    let (file, served_components, encoding, fallback) = match open_representation(
         root,
         &components,
-        request.accept_gzip && config.gzip_enabled(),
+        request.accepted_encodings,
+        config.brotli_enabled(),
+        config.gzip_enabled(),
     ) {
         Ok(opened) => (opened.0, components.clone(), opened.1, false),
         Err(error) if is_not_found(&error) && !requested_asset => {
+            if config.deny_dotfiles() && contains_denied_dotfile(config.index()) {
+                return simple_error(
+                    stream,
+                    response.deadline,
+                    request.method.as_str(),
+                    response.path,
+                    Status::NotFound,
+                    "dotfile_denied",
+                    response.extra_headers,
+                );
+            }
             match open_representation(
                 root,
                 config.index(),
-                request.accept_gzip && config.gzip_enabled(),
+                request.accepted_encodings,
+                config.brotli_enabled(),
+                config.gzip_enabled(),
             ) {
                 Ok(opened) => (opened.0, config.index().to_vec(), opened.1, true),
                 Err(index_error) if is_not_found(&index_error) => {
@@ -367,6 +415,7 @@ fn serve_static(
                         response.path,
                         Status::NotFound,
                         "not_found",
+                        response.extra_headers,
                     )
                 }
                 Err(_) => {
@@ -377,6 +426,7 @@ fn serve_static(
                         response.path,
                         Status::InternalServerError,
                         "open_index",
+                        response.extra_headers,
                     )
                 }
             }
@@ -389,6 +439,7 @@ fn serve_static(
                 response.path,
                 Status::NotFound,
                 "not_found",
+                response.extra_headers,
             )
         }
         Err(_) => {
@@ -399,6 +450,7 @@ fn serve_static(
                 response.path,
                 Status::InternalServerError,
                 "open_file",
+                response.extra_headers,
             )
         }
     };
@@ -413,21 +465,28 @@ fn serve_static(
                 response.path,
                 Status::InternalServerError,
                 "metadata",
+                response.extra_headers,
             )
         }
     };
     let etag = etag(&metadata);
+    let last_modified = http_date(metadata.mtime());
     let cache_control = cache_control(&served_components, fallback, config);
     let mime = content_type(&served_components);
-    let mut headers = vec![("Cache-Control", cache_control), ("ETag", etag.as_str())];
-    if config.gzip_enabled() {
+    let mut headers = vec![
+        ("Cache-Control", cache_control),
+        ("ETag", etag.as_str()),
+        ("Last-Modified", last_modified.as_str()),
+    ];
+    if config.gzip_enabled() || config.brotli_enabled() {
         headers.push(("Vary", "Accept-Encoding"));
     }
-    if compressed {
-        headers.push(("Content-Encoding", "gzip"));
+    if let Some(value) = encoding.header_value() {
+        headers.push(("Content-Encoding", value));
     }
+    append_extra_headers(&mut headers, response.extra_headers);
 
-    if if_none_match_matches(request.if_none_match.as_deref(), &etag) {
+    if is_not_modified(&request, &etag, metadata.mtime()) {
         let head = response_head(Status::NotModified, metadata.len(), None, &headers);
         return match net::write_all(stream, &head, response.deadline) {
             Ok(()) => RequestOutcome::new(
@@ -472,17 +531,52 @@ fn serve_static(
 fn open_representation(
     root: &RootDir,
     components: &[Vec<u8>],
-    gzip: bool,
-) -> io::Result<(File, bool)> {
-    if gzip {
-        let compressed = gzip_path(components);
-        match root.open_file(&compressed) {
-            Ok(file) => return Ok((file, true)),
-            Err(error) if is_not_found(&error) => {}
+    accepted: crate::http::AcceptedEncodings,
+    brotli_enabled: bool,
+    gzip_enabled: bool,
+) -> io::Result<(File, RepresentationEncoding)> {
+    let try_brotli = brotli_enabled && accepted.accepts_br();
+    let try_gzip = gzip_enabled && accepted.accepts_gzip();
+    if try_brotli && accepted.prefer_br() {
+        match open_compressed(root, components, RepresentationEncoding::Br) {
+            Ok(Some(file)) => return Ok((file, RepresentationEncoding::Br)),
+            Ok(None) => {}
             Err(error) => return Err(error),
         }
     }
-    root.open_file(components).map(|file| (file, false))
+    if try_gzip {
+        match open_compressed(root, components, RepresentationEncoding::Gzip) {
+            Ok(Some(file)) => return Ok((file, RepresentationEncoding::Gzip)),
+            Ok(None) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if try_brotli && !accepted.prefer_br() {
+        match open_compressed(root, components, RepresentationEncoding::Br) {
+            Ok(Some(file)) => return Ok((file, RepresentationEncoding::Br)),
+            Ok(None) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    root.open_file(components)
+        .map(|file| (file, RepresentationEncoding::Identity))
+}
+
+fn open_compressed(
+    root: &RootDir,
+    components: &[Vec<u8>],
+    encoding: RepresentationEncoding,
+) -> io::Result<Option<File>> {
+    let compressed = match encoding {
+        RepresentationEncoding::Br => br_path(components),
+        RepresentationEncoding::Gzip => gzip_path(components),
+        RepresentationEncoding::Identity => unreachable!("identity has no compressed sidecar"),
+    };
+    match root.open_file(&compressed) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn request_path_for_log(target: &[u8]) -> String {
@@ -513,6 +607,12 @@ fn starts_with_components(path: &[Vec<u8>], prefix: &[Vec<u8>]) -> bool {
     path.starts_with(prefix)
 }
 
+fn contains_denied_dotfile(components: &[Vec<u8>]) -> bool {
+    components.iter().enumerate().any(|(index, component)| {
+        component.starts_with(b".") && !(index == 0 && component.as_slice() == b".well-known")
+    })
+}
+
 fn etag(metadata: &std::fs::Metadata) -> String {
     format!(
         "\"{:x}-{:x}-{:x}-{:x}\"",
@@ -523,13 +623,23 @@ fn etag(metadata: &std::fs::Metadata) -> String {
     )
 }
 
-fn simple_error(
+fn is_not_modified(request: &Request, etag: &str, mtime: i64) -> bool {
+    if request.if_none_match.is_some() {
+        return if_none_match_matches(request.if_none_match.as_deref(), etag);
+    }
+    request
+        .if_modified_since
+        .is_some_and(|since| mtime >= 0 && mtime <= since)
+}
+
+fn simple_error<'a>(
     stream: &mut TcpStream,
     deadline: Instant,
     method: &str,
     path: &str,
     status: Status,
     error: &'static str,
+    extra_headers: &'a [Header],
 ) -> RequestOutcome {
     let error_deadline = deadline.max(Instant::now() + ERROR_RESPONSE_TIMEOUT);
     let body: &[u8] = match status {
@@ -544,6 +654,7 @@ fn simple_error(
     if status == Status::MethodNotAllowed {
         headers.push(("Allow", "GET, HEAD"));
     }
+    append_extra_headers(&mut headers, extra_headers);
     let head = response_head(
         status,
         body.len() as u64,
@@ -562,15 +673,17 @@ fn simple_error(
     }
 }
 
-fn simple_response(
+fn simple_response<'a>(
     stream: &mut TcpStream,
-    response: &ResponseContext<'_>,
+    response: &ResponseContext<'a>,
     status: Status,
     body: &[u8],
     content_type: &str,
-    headers: &[(&str, &str)],
+    headers: &[(&'a str, &'a str)],
 ) -> RequestOutcome {
-    let head = response_head(status, body.len() as u64, Some(content_type), headers);
+    let mut headers = headers.to_vec();
+    append_extra_headers(&mut headers, response.extra_headers);
+    let head = response_head(status, body.len() as u64, Some(content_type), &headers);
     if net::write_all(stream, &head, response.deadline).is_err() {
         return RequestOutcome::error(
             response.method.as_str(),
@@ -595,6 +708,12 @@ fn simple_response(
             status,
             "write_body",
         ),
+    }
+}
+
+fn append_extra_headers<'a>(headers: &mut Vec<(&'a str, &'a str)>, extra_headers: &'a [Header]) {
+    for header in extra_headers {
+        headers.push((header.name(), header.value()));
     }
 }
 
@@ -635,7 +754,9 @@ impl WorkQueue {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
-            if discard_expired(&mut state) {
+            let discarded = discard_expired(&mut state);
+            if discarded > 0 {
+                log_queue_discarded(discarded);
                 self.not_full.notify_all();
             }
             if state.streams.len() < self.capacity
@@ -654,6 +775,7 @@ impl WorkQueue {
             return false;
         }
         if Instant::now() >= work.deadline {
+            log_queue_discarded(1);
             return true;
         }
         state.streams.push_back(work);
@@ -667,7 +789,9 @@ impl WorkQueue {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
-            if discard_expired(&mut state) {
+            let discarded = discard_expired(&mut state);
+            if discarded > 0 {
+                log_queue_discarded(discarded);
                 self.not_full.notify_all();
             }
             if let Some(work) = state.streams.pop_front() {
@@ -696,7 +820,7 @@ impl WorkQueue {
     }
 }
 
-fn discard_expired(state: &mut QueueState) -> bool {
+fn discard_expired(state: &mut QueueState) -> usize {
     // Accepted connections enter the FIFO with monotonically increasing deadlines.
     let initial_len = state.streams.len();
     let now = Instant::now();
@@ -707,7 +831,7 @@ fn discard_expired(state: &mut QueueState) -> bool {
     {
         state.streams.pop_front();
     }
-    state.streams.len() != initial_len
+    initial_len - state.streams.len()
 }
 
 fn join_workers(
@@ -724,7 +848,7 @@ fn join_workers(
             return Err(ServerError::ShutdownTimeout);
         }
         match finished.recv_timeout(wait) {
-            Ok(worker_id) if !completed[worker_id] => {
+            Ok(worker_id) if worker_id < completed.len() && !completed[worker_id] => {
                 completed[worker_id] = true;
                 remaining -= 1;
             }
@@ -766,12 +890,16 @@ fn log_started(config: &Config) {
     eprintln!(
         concat!(
             "{{\"event\":\"started\",\"listen\":\"{}\",",
-            "\"root\":\"{}\",\"threads\":{},\"queue_size\":{}}}"
+            "\"root\":\"{}\",\"threads\":{},\"queue_size\":{},",
+            "\"gzip\":{},\"brotli\":{},\"deny_dotfiles\":{}}}"
         ),
         escape_json(&config.listen_addr().to_string()),
         escape_json(&config.root().to_string_lossy()),
         config.threads(),
         config.queue_size(),
+        config.gzip_enabled(),
+        config.brotli_enabled(),
+        config.deny_dotfiles(),
     );
 }
 
@@ -784,6 +912,10 @@ fn log_accept_error(error: &io::Error) {
         "{{\"event\":\"accept_error\",\"error\":\"{}\"}}",
         escape_json(&error.to_string()),
     );
+}
+
+fn log_queue_discarded(count: usize) {
+    eprintln!("{{\"event\":\"queue_discarded\",\"count\":{count}}}");
 }
 
 fn log_request(peer: Option<SocketAddr>, outcome: &RequestOutcome, elapsed: Duration) {
@@ -830,7 +962,8 @@ fn escape_json(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        discard_expired, is_accept_resource_exhaustion, request_path_for_log, QueueState, WorkItem,
+        contains_denied_dotfile, discard_expired, is_accept_resource_exhaustion,
+        request_path_for_log, QueueState, WorkItem,
     };
     use std::collections::VecDeque;
     use std::io;
@@ -873,7 +1006,21 @@ mod tests {
             closed: false,
         };
 
-        assert!(discard_expired(&mut state));
+        assert_eq!(discard_expired(&mut state), 1);
         assert!(state.streams.is_empty());
+    }
+
+    #[test]
+    fn dotfile_denial_allows_well_known_only() {
+        assert!(contains_denied_dotfile(&[b".env".to_vec()]));
+        assert!(contains_denied_dotfile(&[
+            b".well-known".to_vec(),
+            b".secret".to_vec()
+        ]));
+        assert!(!contains_denied_dotfile(&[
+            b".well-known".to_vec(),
+            b"acme-challenge".to_vec(),
+            b"token".to_vec()
+        ]));
     }
 }
