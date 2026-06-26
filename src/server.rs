@@ -632,14 +632,14 @@ fn is_not_modified(request: &Request, etag: &str, mtime: i64) -> bool {
         .is_some_and(|since| mtime >= 0 && mtime <= since)
 }
 
-fn simple_error<'a>(
+fn simple_error(
     stream: &mut TcpStream,
     deadline: Instant,
     method: &str,
     path: &str,
     status: Status,
     error: &'static str,
-    extra_headers: &'a [Header],
+    extra_headers: &[Header],
 ) -> RequestOutcome {
     let error_deadline = deadline.max(Instant::now() + ERROR_RESPONSE_TIMEOUT);
     let body: &[u8] = match status {

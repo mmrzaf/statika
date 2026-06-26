@@ -99,7 +99,10 @@ fn send_file_fallback(
 }
 
 fn sendfile_can_fallback(error: &io::Error) -> bool {
-    matches!(error.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOSYS))
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL) | Some(libc::ENOSYS)
+    )
 }
 
 pub fn wait_fd(fd: libc::c_int, events: libc::c_short, deadline: Instant) -> io::Result<()> {

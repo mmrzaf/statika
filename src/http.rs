@@ -505,7 +505,9 @@ fn contains_ctl(bytes: &[u8]) -> bool {
 }
 
 fn value_contains_invalid_ctl(bytes: &[u8]) -> bool {
-    bytes.iter().any(|byte| matches!(*byte, 0..=8 | 10..=31 | 127))
+    bytes
+        .iter()
+        .any(|byte| matches!(*byte, 0..=8 | 10..=31 | 127))
 }
 
 fn is_request_target_safe(bytes: &[u8]) -> bool {

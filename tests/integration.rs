@@ -276,7 +276,10 @@ fn rejects_asset_fallback_symlinks_dotfiles_bad_targets_and_unsupported_methods(
             addr,
             &format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
         );
-        assert!(head.starts_with("HTTP/1.1 400 Bad Request"), "{target}: {head}");
+        assert!(
+            head.starts_with("HTTP/1.1 400 Bad Request"),
+            "{target}: {head}"
+        );
     }
 
     let (head, body) = request(addr, "GET /.env HTTP/1.1\r\nHost: localhost\r\n\r\n");
