@@ -67,7 +67,7 @@ jobs:
           file "dist/statika-${GITHUB_REF_NAME}-linux-amd64"
           ldd_output="$(ldd "dist/statika-${GITHUB_REF_NAME}-linux-amd64" 2>&1 || true)"
           echo "$ldd_output"
-          if echo "$ldd_output" | grep -q 'not a dynamic executable'; then
+          if echo "$ldd_output" | grep -Eq 'not a dynamic executable|statically linked'; then
             echo "static binary verified"
           else
             echo "release binary is dynamically linked" >&2
