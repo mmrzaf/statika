@@ -7,7 +7,7 @@ COPY src ./src
 RUN cargo build --locked --release && /src/target/release/statika --version
 
 FROM scratch
-ARG VERSION=0.3.4
+ARG VERSION=0.3.5
 ARG REVISION=unknown
 LABEL org.opencontainers.image.title="statika" \
       org.opencontainers.image.description="Lightweight static file server for containerized deployments" \
