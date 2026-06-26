@@ -119,16 +119,6 @@ jobs:
           done
           test "$(curl --fail --silent http://127.0.0.1:18080/)" = ok
           docker run --rm --entrypoint /statika "statika:${GITHUB_REF_NAME}" --version
-      - name: Create SBOM
-        run: |
-          set -euo pipefail
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b "$RUNNER_TEMP"
-          "$RUNNER_TEMP/syft" packages \
-            "dist/statika-${GITHUB_REF_NAME}-linux-amd64" \
-            -o spdx-json="dist/statika-${GITHUB_REF_NAME}-linux-amd64.spdx.json"
-          "$RUNNER_TEMP/syft" packages \
-            "docker-archive:dist/statika-${GITHUB_REF_NAME}-linux-amd64-docker.tar.gz" \
-            -o spdx-json="dist/statika-${GITHUB_REF_NAME}-linux-amd64-docker.spdx.json"
       - name: Push container image
         env:
           IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
